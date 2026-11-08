@@ -1,0 +1,19 @@
+service:
+  type: LoadBalancer   # ← the fix; chart default is NodePort
+apisix:
+  deployment:
+    role: traditional
+    role_traditional:
+      config_provider: yaml
+etcd:
+  enabled: false
+ingress-controller:
+  enabled: true
+  apisix:
+    adminService:
+      namespace: ingress-apisix
+  config:
+    provider:
+      type: apisix-standalone
+  gatewayProxy:
+    createDefault: true
