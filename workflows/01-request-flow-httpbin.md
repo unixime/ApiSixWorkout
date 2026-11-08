@@ -1,13 +1,19 @@
 # Workflow 01 — How a request reaches the httpbin backend
 
-This document traces a single HTTP request from your laptop to the httpbin
-pod, and explains the role of every Kubernetes/APISIX resource it passes
-through.
+This document traces a single request from your laptop to the httpbin pod,
+and explains the role of every Kubernetes/APISIX resource it passes through.
+It covers both plain HTTP and HTTPS (TLS-terminated) requests — the two flows
+share everything except the entry point.
 
-## The test request
+## The test requests
 
 ```bash
+# Plain HTTP
 curl -H "Host: httpbin.local" http://172.18.255.200/get
+
+# HTTPS (requires the TLS setup in manifests/06-tls/README.md)
+curl --cacert httpbin-local.crt --resolve httpbin.local:443:172.18.255.200 \
+  https://httpbin.local/get
 ```
 
 Expected result: a JSON document from httpbin echoing the request headers,
@@ -24,10 +30,11 @@ flowchart TD
     end
 
     subgraph ns_apisix["namespace: ingress-apisix"]
-        gw_svc["Service apisix-gateway<br/>LoadBalancer :80"]
-        apisix["APISIX data plane pod<br/>(proxy)"]
+        gw_svc["Service apisix-gateway<br/>LoadBalancer :80 / :443"]
+        apisix["APISIX data plane pod<br/>(proxy, TLS termination)"]
         controller["APISIX Ingress Controller<br/>(control plane)"]
         admin["Service apisix-admin :9180"]
+        tls_secret["Secret httpbin-tls<br/>(cert + key)"]
     end
 
     subgraph ns_httpbin["namespace: httpbin"]
@@ -36,19 +43,20 @@ flowchart TD
     end
 
     gwc["GatewayClass apisix"]
-    gw["Gateway apisix<br/>listener HTTP:80"]
+    gw["Gateway apisix<br/>listeners HTTP:80, HTTPS:443"]
     route["HTTPRoute httpbin<br/>host httpbin.local, path /"]
 
     %% data path
-    curl -->|"GET /get"| metallb --> gw_svc --> apisix
-    apisix -->|"proxies to endpoint"| httpbin_pod
+    curl -->|"GET /get (HTTP or HTTPS)"| metallb --> gw_svc --> apisix
+    apisix -->|"proxies to endpoint (plain HTTP)"| httpbin_pod
     httpbin_svc -.->|"groups endpoints"| httpbin_pod
 
     %% control plane
     gwc -.->|"watches"| controller
     gw -.->|"watches"| controller
     route -.->|"watches"| controller
-    controller -->|"pushes routes via admin API"| admin --> apisix
+    tls_secret -.->|"referenced by listener"| gw
+    controller -->|"pushes routes + SSL via admin API"| admin --> apisix
     route -.->|"backendRef"| httpbin_svc
 
     classDef datapath fill:#d4edda,stroke:#28a745
@@ -73,8 +81,11 @@ request never leaves the machine.
 
 ### 2. Service `apisix-gateway` (namespace `ingress-apisix`)
 
-The front door of APISIX. Type `LoadBalancer`, port 80, backed by the APISIX
+The front door of APISIX. Type `LoadBalancer`, backed by the APISIX
 data-plane pod. Everything external clients send to the gateway arrives here.
+With the base Helm values it exposes only port 80; the
+[ssl.yaml](../manifests/01-apisix/ssl.yaml) overlay adds `443 → 9443` for
+HTTPS.
 
 ### 3. GatewayClass `apisix`
 
@@ -85,18 +96,29 @@ through it — it is pure control-plane metadata.
 
 ### 4. Gateway `apisix` (namespace `ingress-apisix`)
 
-Describes the *listener*: protocol HTTP, port 80. Its
+Describes the *listeners*: HTTP on port 80, and (once the TLS setup is
+applied) HTTPS on port 443 with `tls.mode: Terminate` and a
+`certificateRefs` pointer to the `httpbin-tls` Secret. Its
 `allowedRoutes.namespaces.from: All` field is what permits HTTPRoutes living
 in other namespaces (like `httpbin`) to attach to it. The
 `infrastructure.parametersRef` pointing at the `GatewayProxy` resource tells
 the controller which APISIX instance (and admin API credentials) to program.
 
+### 4b. Secret `httpbin-tls` (namespace `ingress-apisix`) — HTTPS only
+
+A `kubernetes.io/tls` Secret holding the self-signed certificate and private
+key for `httpbin.local`. It must live in the Gateway's namespace because
+`certificateRefs` are resolved there. The controller reads it and pushes an
+SSL object to APISIX; the data plane then uses the key to terminate TLS.
+
 ### 5. HTTPRoute `httpbin` (namespace `httpbin`)
 
 The routing rule: *requests with hostname `httpbin.local` and path prefix `/`
 go to service `httpbin` on port 80*. Its `parentRefs` field attaches it to
-the Gateway above. This is the resource the ingress controller translates
-into an APISIX route object.
+the Gateway above — with no `sectionName`, so it binds to **all** listeners
+whose hostname intersects. That is why the same route serves both HTTP:80
+and HTTPS:443 without any change. This is the resource the ingress
+controller translates into an APISIX route object.
 
 ### 6. APISIX Ingress Controller (namespace `ingress-apisix`)
 
@@ -108,12 +130,20 @@ crashes, existing routes keep working.
 
 ### 7. APISIX data plane (namespace `ingress-apisix`)
 
-The actual proxy. On each request it:
+The actual proxy. For an **HTTPS** request it first performs the TLS
+handshake: the client sends the desired hostname in cleartext as SNI, APISIX
+selects the matching SSL object (pushed from the `httpbin-tls` Secret) and
+presents its certificate, then decrypts the request. From that point on, the
+flow is identical to plain HTTP:
 
 1. matches the `Host` header against the configured routes (`httpbin.local`),
 2. matches the path (`/` prefix — everything),
 3. rewrites/proxies the request to the upstream (the httpbin service
    endpoints), adding `X-Forwarded-*` headers.
+
+Note the asymmetry: TLS exists **only between client and gateway**. The hop
+from APISIX to httpbin is plain HTTP in both flows — termination at the
+gateway is exactly what lets APISIX inspect and route the request.
 
 APISIX resolves the backend to pod IPs directly (it watches endpoints), so
 inside the cluster the request goes straight to the httpbin pod.
@@ -137,8 +167,9 @@ decoupling is the point: routing policy lives entirely in the gateway layer.
 | MetalLB IPAddressPool/L2Advertisement | Network exposure | Yes (ARP/IP) |
 | Service `apisix-gateway` | Entry point | Yes |
 | GatewayClass / Gateway / HTTPRoute | Declarative intent | No (config only) |
+| Secret `httpbin-tls` | TLS credentials (HTTPS only) | No (read by controller) |
 | Ingress Controller | Control plane (configures APISIX) | No |
-| APISIX data plane | Proxy / enforcement point | Yes |
+| APISIX data plane | Proxy / TLS termination point | Yes |
 | Service `httpbin` + pod | Backend | Yes |
 
 ## Verify it yourself
@@ -152,9 +183,15 @@ kubectl describe httproute httpbin -n httpbin
 kubectl get svc apisix-gateway -n ingress-apisix
 # → EXTERNAL-IP 172.18.255.200
 
-# End-to-end
+# End-to-end (HTTP)
 curl -i -H "Host: httpbin.local" http://172.18.255.200/get
 # → HTTP/1.1 200 OK, JSON body with X-Forwarded-Host: httpbin.local
+
+# End-to-end (HTTPS, after the manifests/06-tls setup)
+curl -v --cacert httpbin-local.crt --resolve httpbin.local:443:172.18.255.200 \
+  https://httpbin.local/get
+# → handshake shows "subject: CN=httpbin.local" and "SSL certificate verify ok",
+#   then HTTP 200 with the same JSON body
 ```
 
 ## Things to try next
@@ -163,3 +200,6 @@ curl -i -H "Host: httpbin.local" http://172.18.255.200/get
   returns 404: no route matches, proving host-based routing works.
 - Change the HTTPRoute `path` match from `/` to `/get` and re-apply →
   `/headers` starts returning 404 while `/get` still works.
+- Over HTTPS, request the IP directly (`curl -vk https://172.18.255.200/get`)
+  → no SNI hostname is sent, so cert selection and routing behave
+  differently: a good way to see why SNI matters.

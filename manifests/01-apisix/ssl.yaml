@@ -1,0 +1,14 @@
+# Overlay values file: HTTPS support for the gateway.
+#
+# Usage — pass it AFTER the base values so it merges on top:
+#   helm upgrade apisix apisix/apisix -n ingress-apisix \
+#     -f manifests/01-apisix/values.yaml -f manifests/01-apisix/ssl.yaml
+#
+# Enable APISIX's built-in HTTPS listener (container port 9443) and make the
+# chart expose port 443 on the apisix-gateway Service.
+# Required for Gateway API HTTPS listeners: the ingress controller cannot
+# open data-plane ports dynamically, so APISIX must already listen for TLS
+# before a listener on port 443 can become Programmed.
+apisix:
+  ssl:
+    enabled: true

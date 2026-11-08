@@ -12,6 +12,25 @@ spec:
     allowedRoutes:
       namespaces:
         from: All
+  - name: https
+    protocol: HTTPS
+    port: 443
+    # Scope this listener to the demo hostname. The existing HTTPRoute for
+    # httpbin.local attaches here automatically (its parentRef has no
+    # sectionName, so it binds to every listener whose hostname intersects).
+    hostname: httpbin.local
+    tls:
+      # Terminate = APISIX holds the private key and decrypts; traffic from
+      # APISIX to the httpbin backend stays plain HTTP.
+      mode: Terminate
+      certificateRefs:
+      # Secret is resolved in the Gateway's own namespace (ingress-apisix).
+      # Referencing a Secret in another namespace would require a ReferenceGrant.
+      - kind: Secret
+        name: httpbin-tls
+    allowedRoutes:
+      namespaces:
+        from: All
   infrastructure:
     parametersRef:
       group: apisix.apache.org
